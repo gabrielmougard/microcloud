@@ -1,0 +1,871 @@
+#!/bin/bash
+
+# Command examples:
+# ./microinfra setup --with-tracing microcloudd --with-ceph-public-net --with-ceph-cluster-net --with-ceph-encrypt --with-ovn-underlay-net --microcloud-snap-pkg-source-path=/home/infinity/go/src/github.com/microcloud-pkg-snap
+
+# Default values
+lxd_snap_chan="5.21/edge"
+microceph_snap_chan="squid/edge"
+microovn_snap_chan="latest/edge"
+microcloud_snap_chan="latest/edge"
+
+with_ovn_underlay_net=false
+with_ceph_encrypt=false
+with_ceph_public_net=false
+with_ceph_cluster_net=false
+
+with_custom_microcloudd=false
+with_custom_microcloud=false
+
+with_tracing=false
+allowed_tracing_values=("microcloud" "microcloudd" "microovn" "microovnd" "microceph" "microcephd" "lxd")
+chosen_tracing_options=()
+microcloud_tracing=0
+microcloudd_tracing=0
+microovn_tracing=0
+microovnd_tracing=0
+microceph_tracing=0
+microcephd_tracing=0
+lxd_tracing=0
+
+microcloud_snap_pkg_source_path=""
+microceph_snap_pkg_source_path=""
+microovn_snap_pkg_source_path=""
+lxd_snap_pkg_source_path=""
+
+# Check if a value is in the allowed_tracing_values array
+function is_allowed_tracing_value() {
+    local value="$1"
+
+    for allowed in "${allowed_tracing_values[@]}"; do
+        if [[ "$allowed" == "$value" ]]; then
+            return 0
+        fi
+    done
+
+  return 1
+}
+
+# Function to display help
+function show_help() {
+    cat << EOF
+Usage: $0 [command] [options]
+
+Commands:
+  setup            Set up 4 VMs (micro{1..4}) for a MicroCloud deployment
+  cleanup          Remove the 4 VMs created by the 'setup' command
+  --help           Show this help message
+
+Options for 'setup' command:
+  --lxd-snap-chan=<channel>                                                             Default: "5.21/edge"
+  --microceph-snap-chan=<channel>                                                       Default: "quincy/stable"
+  --microovn-snap-chan=<channel>                                                        Default: "22.03/stable"
+  --microcloud-snap-chan=<channel>                                                      Default: "latest/stable"
+
+  --with-ovn-underlay                                                                   Create a supplementary NIC to be used for an OVN underlay
+  --with-ceph-encrypt                                                                   Enable Ceph encryption
+  --with-ceph-public                                                                    Create a supplementary NIC to be used for a Ceph public network
+  --with-ceph-cluster                                                                   Create a supplementary NIC to be used for a Ceph cluster network
+
+  --with-custom-microcloudd                                                             Use a custom microcloudd binary
+  --with-custom-microcloud                                                              Use a custom microcloud binary
+
+  --with-tracing <microcloud,microcloudd,microovn,microovnd,microceph,microcephd,lxd>   Enable automatic OpenTelemetry instrumentation on the specified comma-separated list of services
+  --microcloud-snap-pkg-source-path=<path>                                              Path to MicroCloud snap package source (required if '--with-tracing' is set with either 'microcloud' or 'microcloudd')
+  --microceph-snap-pkg-source-path=<path>                                               Path to MicroCeph snap package source (required if '--with-tracing' is set with either 'microceph' or 'microcephd')
+  --microovn-snap-pkg-source-path=<path>                                                Path to MicroOVN snap package source (required if '--with-tracing' is set with either 'microovn' or 'microovnd')
+  --lxd-snap-pkg-source-path=<path>                                                     Path to LXD snap package source (required if '--with-tracing' is set with 'lxd')
+EOF
+}
+
+# Check if no arguments were provided
+if [ "$#" -eq 0 ]; then
+    show_help
+    exit 1
+fi
+
+cleanup() {
+  echo "No cleanup actions defined."
+}
+
+trap cleanup SIGQUIT SIGINT SIGTERM
+
+# Ensure a storage volume exists
+function ensure_volume_exists() {
+    local pool="$1"
+    local volume="$2"
+    shift 2  # Remove first two arguments (pool and volume)
+    # Remaining arguments are options for 'lxc storage volume create'
+
+    if lxc storage volume show "$pool" "$volume" >/dev/null 2>&1; then
+        echo "Volume '$volume' already exists in storage pool '$pool'. Recreating it..."
+        lxc storage volume delete "$pool" "$volume"
+        lxc storage volume create "$pool" "$volume" "$@"
+    else
+        echo "Creating volume '$volume' in storage pool '$pool'..."
+        lxc storage volume create "$pool" "$volume" "$@"
+    fi
+}
+
+# Recreate an instance
+function recreate_instance() {
+    local instance_name="$1"
+
+    if lxc info "$instance_name" >/dev/null 2>&1; then
+        echo "Instance '$instance_name' already exists. Deleting it..."
+        lxc delete "$instance_name" --force
+    fi
+
+    echo "Initializing instance '$instance_name'..."
+    lxc init ubuntu:24.04 "$instance_name" --vm --config limits.cpu=2 --config limits.memory=2GiB
+}
+
+# Ensure a network exists
+function ensure_network_exists() {
+    local network_name="$1"
+
+    if lxc network show "$network_name" >/dev/null 2>&1; then
+        echo "Network '$network_name' already exists."
+    else
+        echo "Creating network '$network_name'..."
+        lxc network create "$network_name"
+    fi
+
+    # Get the IPv4 address of the network
+    ipv4_address=$(lxc network get "$network_name" ipv4.address)
+    if [ -n "$ipv4_address" ] && [ "$ipv4_address" != "none" ]; then
+        # Print the IPv4 address in green
+        echo -e "Network '$network_name' IPv4 address: \033[32m$ipv4_address\033[0m"
+    else
+        echo "No IPv4 address found for network '$network_name'."
+    fi
+}
+
+# Wait for cloud-init to finish on all instances
+function wait_for_instances() {
+    for i in {1..4}; do
+        lxc exec micro${i} -- cloud-init status --wait
+    done
+}
+
+# Check if 'yq' is installed
+function check_yq() {
+    if [ ! command -v yq &> /dev/null ]; then
+        echo "'yq' could not be found. Please install 'yq' to use this script."
+        exit 1
+    fi
+}
+
+# Check if 'jq' is installed
+function check_jq() {
+    if [ ! command -v yq &> /dev/null ]; then
+        echo "'yq' could not be found. Please install 'yq' to use this script."
+        exit 1
+    fi
+}
+
+# Function to configure an instance's NICs
+function configure_instance_nics() {
+    local instance_name="$1"
+    local ovn_underlay_network_addr="$2"
+    local ceph_public_network_addr="$3"
+    local ceph_cluster_network_addr="$4"
+
+    echo "Configuring instance '$instance_name'..."
+
+    # Disable IPv6 Router Advertisements on enp6s0 and bring it up
+    lxc exec "$instance_name" -- sh -c "echo 0 > /proc/sys/net/ipv6/conf/enp6s0/accept_ra"
+    lxc exec "$instance_name" -- ip link set enp6s0 up
+
+    # If Ceph cluster network is enabled, configure enp7s0
+    if [ "$with_ceph_cluster_net" = true ]; then
+        IFS='/' read -r NET_PART PREFIX <<< "$ceph_cluster_network_addr"
+        IFS='.' read -r A B C D <<< "$NET_PART"
+        IP_ADDR="$A.$B.$C.2"
+        lxc exec "$instance_name" -- sh -c "ip addr add $IP_ADDR/$PREFIX dev enp7s0 && ip link set enp7s0 up"
+    fi
+
+    # If Ceph public network is enabled, configure enp8s0
+    if [ "$with_ceph_public_net" = true ]; then
+        IFS='/' read -r NET_PART PREFIX <<< "$ceph_public_network_addr"
+        IFS='.' read -r A B C D <<< "$NET_PART"
+        IP_ADDR="$A.$B.$C.2"
+        lxc exec "$instance_name" -- sh -c "ip addr add $IP_ADDR/$PREFIX dev enp8s0 && ip link set enp8s0 up"
+    fi
+
+    # If OVN underlay network is enabled, configure enp9s0
+    if [ "$with_ovn_underlay_net" = true ]; then
+        IFS='/' read -r NET_PART PREFIX <<< "$ovn_underlay_network_addr"
+        IFS='.' read -r A B C D <<< "$NET_PART"
+        IP_ADDR="$A.$B.$C.2"
+        lxc exec "$instance_name" -- sh -c "ip addr add $IP_ADDR/$PREFIX dev enp9s0 && ip link set enp9s0 up"
+    fi
+
+    echo "Instance '$instance_name' configured."
+}
+
+# Configure the MicroOVN snap to use auto instrumentation
+function build_traced_microovn_snaps() {
+    local microovn_snap_pkg_source_path="$1"
+    local micro1_internal_addr="$2"
+    local microovn_tracing="$3"
+    local microovnd_tracing="$4"
+
+    # Backup the original snapcraft.yaml and command files
+    mkdir -p /tmp/microovn_trace_bak
+    cp $microovn_snap_pkg_source_path/snap/snapcraft.yaml /tmp/microovn_trace_bak/snapcraft.yaml.bak
+    cp $microovn_snap_pkg_source_path/snapcraft/commands/daemon.start /tmp/microovn_trace_bak/daemon.start.bak
+    cp $microovn_snap_pkg_source_path/snapcraft/commands/microovn /tmp/microovn_trace_bak/microovn.bak
+
+    cat <<'EOF' > $microovn_snap_pkg_source_path/otel_tracing_part.yaml
+tracing:
+  source: https://github.com/gabrielmougard/opentelemetry-go-instrumentation
+  source-type: git
+  after:
+    - microovn
+  build-snaps:
+    - go
+  plugin: nil
+  build-packages:
+    - curl
+    - clang
+    - gcc
+    - llvm
+    - libbpf-dev
+  override-build: |
+    set -ex
+    make build
+
+    mkdir -p ${CRAFT_PART_INSTALL}/bin
+    cp otel-go-instrumentation ${CRAFT_PART_INSTALL}/bin/microtrace
+  prime:
+    - bin/microtrace
+EOF
+
+    yq eval ".parts += load(\"${microovn_snap_pkg_source_path}/otel_tracing_part.yaml\")" "${microovn_snap_pkg_source_path}/snap/snapcraft.yaml" > "${microovn_snap_pkg_source_path}/snap/snapcraft_patched.yaml"7
+    mv "${microovn_snap_pkg_source_path}/snap/snapcraft_patched.yaml" "${microovn_snap_pkg_source_path}/snap/snapcraft.yaml"
+    rm $microovn_snap_pkg_source_path/otel_tracing_part.yaml
+    echo "MicroOVN 'snapcraft.yaml' has been updated with the new 'tracing' part"
+
+    # Patching the snap commands to have the tracing daemon attached to the MicroCloud binaries (daemon or CLI).
+    for i in $(seq 1 4); do
+        nodeName="micro$i"
+        local otel_exporter_otlp_endpoint
+        if [ "$i" -eq 1 ]; then
+            # :4318 is the default port for the Jaeger OTLP collector using HTTP
+            otel_exporter_otlp_endpoint="http://localhost:4318"
+        else
+            otel_exporter_otlp_endpoint="http://$micro1_internal_addr:4318"
+        fi
+
+        if [ $microovnd_tracing == 1 ]; then
+            svcName="microovnd_$i"
+            cat <<EOF > "$microovn_snap_pkg_source_path/snapcraft/commands/daemon.start"
+#!/bin/sh
+. "\${SNAP}/ovn.env"
+
+export DQLITE_SOCKET="@snap.\${SNAP_INSTANCE_NAME}.dqlite"
+
+. "\$SNAP/coverage.env" 2>/dev/null || true
+
+MICROOVND="\${SNAP}/bin/microovnd"
+# Start the MicroOVN daemon
+(
+    exec "\${MICROOVND}" --verbose --state-dir "\${SNAP_COMMON}/state"
+) &
+
+MICROOVND_PID=\$!
+echo \${MICROOVND_PID} > "\${SNAP_COMMON}/microovnd.pid"
+
+sleep 5
+
+# Start the tracing daemon
+(
+    OTEL_GO_AUTO_TARGET_EXE=\${MICROOVND} OTEL_SERVICE_NAME=${svcName} OTEL_RESOURCE_ATTRIBUTES="node=micro$i" OTEL_LOG_LEVEL=debug OTEL_GO_AUTO_GLOBAL=true OTEL_EXPORTER_OTLP_ENDPOINT=${otel_exporter_otlp_endpoint} \${SNAP}/bin/microtrace
+) &
+
+wait "\${MICROOVND_PID}"
+EOF
+        fi
+
+        if [ $microovn_tracing == 1 ]; then
+            svcName="microovn_$i"
+            cat <<EOF > "$microovn_snap_pkg_source_path/snapcraft/commands/microovn"
+#!/bin/sh
+
+MICROOVN="\${SNAP}/bin/microovn"
+
+# Start the tracing daemon
+(
+    OTEL_GO_AUTO_TARGET_EXE=\${MICROCLOUD} OTEL_SERVICE_NAME=${svcName} OTEL_RESOURCE_ATTRIBUTES="node=micro$i" OTEL_LOG_LEVEL=debug OTEL_GO_AUTO_GLOBAL=true OTEL_EXPORTER_OTLP_ENDPOINT=${otel_exporter_otlp_endpoint} \${SNAP}/bin/microtrace
+) &
+
+. "\$SNAP/coverage.env" 2>/dev/null || true
+exec "\${MICROOVN}" --state-dir "\${SNAP_COMMON}/state" "\$@"
+EOF
+        fi
+
+        pushd $microovn_snap_pkg_source_path
+        snapcraft pack -o "traced_microovn_$nodeName.snap"
+        popd
+    done
+
+    # Restore the original snapcraft.yaml and commands
+    mv /tmp/microovn_trace_bak/snapcraft.yaml.bak $microovn_snap_pkg_source_path/snap/snapcraft.yaml
+    mv /tmp/microovn_trace_bak/daemon.start.bak $microovn_snap_pkg_source_path/snapcraft/commands/daemon.start
+    mv /tmp/microovn_trace_bak/microovn.bak $microovn_snap_pkg_source_path/snapcraft/commands/microovn
+}
+
+# Configure the MicroCeph snap to use auto instrumentation
+function build_traced_microceph_snaps() {
+    # TODO
+}
+
+# Configure the LXD snap to use auto instrumentation
+function build_traced_lxd_snaps() {
+    # TODO
+}
+
+# Configure the MicroCloud snap to use auto instrumentation
+function build_traced_microcloud_snaps() {
+    local microcloud_snap_pkg_source_path="$1"
+    local micro1_internal_addr="$2"
+    local microcloud_tracing="$3"
+    local microcloudd_tracing="$4"
+
+    # Backup the original snapcraft.yaml and daemon.start command
+    mkdir -p /tmp/microcloud_trace_bak
+    cp $microcloud_snap_pkg_source_path/snapcraft.yaml /tmp/microcloud_trace_bak/snapcraft.yaml.bak
+    cp $microcloud_snap_pkg_source_path/commands/daemon.start /tmp/microcloud_trace_bak/daemon.start.bak
+    cp $microcloud_snap_pkg_source_path/commands/microcloud /tmp/microcloud_trace_bak/microcloud.bak
+
+    cat <<'EOF' > $microcloud_snap_pkg_source_path/otel_tracing_part.yaml
+tracing:
+  source: https://github.com/gabrielmougard/opentelemetry-go-instrumentation
+  source-type: git
+  after:
+    - microcloud
+  build-snaps:
+    - go
+  plugin: nil
+  build-packages:
+    - curl
+    - clang
+    - gcc
+    - llvm
+    - libbpf-dev
+  override-build: |
+    set -ex
+    make build
+
+    mkdir -p ${CRAFT_PART_INSTALL}/bin
+    cp otel-go-instrumentation ${CRAFT_PART_INSTALL}/bin/microtrace
+  prime:
+    - bin/microtrace
+EOF
+
+    # Patching snapcraft.yaml with the new 'tracing' part and app
+    # We also need to remove stripping in order to keep the debug symbols like .gosymtab, .gopclntab and DWARF sections
+    yq eval ".parts += load(\"${microcloud_snap_pkg_source_path}/otel_tracing_part.yaml\")" "${microcloud_snap_pkg_source_path}/snapcraft.yaml" > "${microcloud_snap_pkg_source_path}/snapcraft_patched.yaml"
+    yq eval 'del(.parts.strip)' -i "${microcloud_snap_pkg_source_path}/snapcraft_patched.yaml"
+    mv "${microcloud_snap_pkg_source_path}/snapcraft_patched.yaml" "${microcloud_snap_pkg_source_path}/snapcraft.yaml"
+    rm $microcloud_snap_pkg_source_path/otel_tracing_part.yaml
+    echo "MicroCloud 'snapcraft.yaml' has been updated with the new 'tracing' part"
+
+    # Patching the snap commands to have the tracing daemon attached to the MicroCloud binaries (daemon or CLI).
+    for i in $(seq 1 4); do
+        nodeName="micro$i"
+        local otel_exporter_otlp_endpoint
+        if [ "$i" -eq 1 ]; then
+            # :4318 is the default port for the Jaeger OTLP collector using HTTP
+            otel_exporter_otlp_endpoint="http://localhost:4318"
+        else
+            otel_exporter_otlp_endpoint="http://$micro1_internal_addr:4318"
+        fi
+
+        if [ $microcloudd_tracing == 1 ]; then
+            svcName="microcloudd_$i"
+            cat <<EOF > "$microcloud_snap_pkg_source_path/snapcraft/commands/daemon.start"
+#!/bin/sh
+export DQLITE_SOCKET="@snap.\${SNAP_INSTANCE_NAME}.dqlite"
+
+MICROCLOUDD="\${SNAP}/bin/microcloudd"
+if [ -x "\${SNAP_COMMON}/microcloudd.debug" ]; then
+    MICROCLOUDD="\${SNAP_COMMON}/microcloudd.debug"
+    echo "==> WARNING: Using a custom debug MicroCloud binary!"
+fi
+
+# Start the MicroCloud daemon
+(
+    exec "\${MICROCLOUDD}" --state-dir "\${SNAP_COMMON}/state"
+) &
+MICROCLOUDD_PID=\$!
+echo \${MICROCLOUDD_PID} > "\${SNAP_COMMON}/microcloudd.pid"
+
+sleep 5
+
+# Start the tracing daemon
+(
+    OTEL_GO_AUTO_TARGET_EXE=\${MICROCLOUDD} OTEL_SERVICE_NAME=${svcName} OTEL_RESOURCE_ATTRIBUTES="node=micro$i" OTEL_LOG_LEVEL=debug OTEL_GO_AUTO_GLOBAL=true OTEL_EXPORTER_OTLP_ENDPOINT=${otel_exporter_otlp_endpoint} \${SNAP}/bin/microtrace
+) &
+
+wait "\${MICROCLOUDD_PID}"
+EOF
+        fi
+
+        if [ $microcloud_tracing == 1 ]; then
+            svcName="microcloud_$i"
+            cat <<EOF > "$microcloud_snap_pkg_source_path/snapcraft/commands/microcloud"
+
+#!/bin/sh
+
+MICROCLOUD="\${SNAP}/bin/microcloud"
+if [ -x "\${SNAP_COMMON}/microcloud.debug" ]; then
+    MICROCLOUD="\${SNAP_COMMON}/microcloud.debug"
+fi
+
+# Start the tracing daemon
+(
+    OTEL_GO_AUTO_TARGET_EXE=\${MICROCLOUD} OTEL_SERVICE_NAME=${svcName} OTEL_RESOURCE_ATTRIBUTES="node=micro$i" OTEL_LOG_LEVEL=debug OTEL_GO_AUTO_GLOBAL=true OTEL_EXPORTER_OTLP_ENDPOINT=${otel_exporter_otlp_endpoint} \${SNAP}/bin/microtrace
+) &
+
+exec "\${MICROCLOUD}" --state-dir "\${SNAP_COMMON}/state" "\$@"
+EOF
+        fi
+
+        pushd $microcloud_snap_pkg_source_path
+        snapcraft pack -o "traced_microcloud_$nodeName.snap"
+        popd
+    done
+
+    # Restore the original snapcraft.yaml and daemon.start command
+    mv /tmp/microcloud_trace_bak/snapcraft.yaml.bak $microcloud_snap_pkg_source_path/snapcraft.yaml
+    mv /tmp/microcloud_trace_bak/daemon.start.bak $microcloud_snap_pkg_source_path/commands/daemon.start
+    mv /tmp/microcloud_trace_bak/microcloud.bak $microcloud_snap_pkg_source_path/commands/microcloud
+}
+
+# Parse the command
+command="$1"
+shift  # Remove the command from the arguments list
+
+case "$command" in
+    setup)
+        # Parse options for the 'setup' command
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --lxd-snap-chan=*)
+                    lxd_snap_chan="${1#*=}"
+                    ;;
+                --microceph-snap-chan=*)
+                    microceph_snap_chan="${1#*=}"
+                    ;;
+                --microovn-snap-chan=*)
+                    microovn_snap_chan="${1#*=}"
+                    ;;
+                --microcloud-snap-chan=*)
+                    microcloud_snap_chan="${1#*=}"
+                    ;;
+                --with-ovn-underlay-net)
+                    with_ovn_underlay_net=true
+                    ;;
+                --with-ceph-encrypt)
+                    with_ceph_encrypt=true
+                    ;;
+                --with-ceph-public-net)
+                    with_ceph_public_net=true
+                    ;;
+                --with-ceph-cluster-net)
+                    with_ceph_cluster_net=true
+                    ;;
+                --with-tracing)
+                    with_tracing=true
+
+                    if [[ -z "$2" || "$2" == "--"* ]]; then
+                        echo "Error: '--with-tracing' requires a comma-separated list of options."
+                        exit 1
+                    fi
+
+                    tracing_args="$2"
+                    shift 2
+                    IFS=',' read -ra tracing_values <<< "$tracing_args"
+
+                    # Validate and store allowed values
+                    for val in "${tracing_values[@]}"; do
+                        if is_allowed_tracing_value "$val"; then
+                            chosen_tracing_options+=("$val")
+                        else
+                            echo "Warning: '$val' is not a valid tracing option and will be ignored."
+                        fi
+                    done
+
+                    for opt in "${chosen_tracing_options[@]}"; do
+                        case "$opt" in
+                            microcloud)
+                                microcloud_tracing=1
+                                ;;
+                            microcloudd)
+                                microcloudd_tracing=1
+                                ;;
+                            microovn)
+                                microovn_tracing=1
+                                ;;
+                            microovnd)
+                                microovnd_tracing=1
+                                ;;
+                            microceph)
+                                microceph_tracing=1
+                                ;;
+                            microcephd)
+                                microcephd_tracing=1
+                                ;;
+                            lxd)
+                                lxd_tracing=1
+                                ;;
+                            *)
+
+                            echo "Unexpected tracing option: $opt"
+                            ;;
+                        esac
+                    done
+                    ;;
+                --with-custom-microcloudd)
+                    with_custom_microcloudd=true
+                    ;;
+                --with-custom-microcloud)
+                    with_custom_microcloud=true
+                    ;;
+                --microcloud-snap-pkg-source-path=*)
+                    microcloud_snap_pkg_source_path="${1#*=}"
+                    ;;
+                --microceph-snap-pkg-source-path=*)
+                    microceph_snap_pkg_source_path="${1#*=}"
+                    ;;
+                --microovn-snap-pkg-source-path=*)
+                    microovn_snap_pkg_source_path="${1#*=}"
+                    ;;
+                --lxd-snap-pkg-source-path=*)
+                    lxd_snap_pkg_source_path="${1#*=}"
+                    ;;
+                *)
+                    echo "Unknown option: $1"
+                    show_help
+                    exit 1
+                    ;;
+            esac
+            shift
+        done
+
+        # Check required options if --with-tracing is enabled
+        if [ "$with_tracing" = true ]; then
+            if [ $microcloud_tracing == 1 -o $microcloudd_tracing == 1 ] && [ -z "$microcloud_snap_pkg_source_path" ]; then
+                echo "Error: The following options are required when --with-tracing is used with 'microcloud' or 'microcloudd':"
+                echo "  --microcloud-snap-pkg-source-path"
+                exit 1
+            fi
+
+            if [ $microceph_tracing == 1 -o $microcephd_tracing == 1 ] && [ -z "$microceph_snap_pkg_source_path" ]; then
+                echo "Error: The following options are required when --with-tracing is used with 'microceph' or 'microcephd':"
+                echo "  --microceph-snap-pkg-source-path"
+                exit 1
+            fi
+
+            if [ $microovn_tracing == 1 -o $microovnd_tracing == 1 ] && [ -z "$microovn_snap_pkg_source_path" ]; then
+                echo "Error: The following options are required when --with-tracing is used with 'microovn' or 'microovnd':"
+                echo "  --microovn-snap-pkg-source-path"
+                exit 1
+            fi
+
+            if [ $lxd_tracing == 1 ] && [ -z "$lxd_snap_pkg_source_path" ]; then
+                echo "Error: The following options are required when --with-tracing is used with 'lxd':"
+                echo "  --lxd-snap-pkg-source-path"
+                exit 1
+            fi
+        fi
+
+        # Begin setup logic
+        echo "Starting setup with the following configuration:"
+        echo "  LXD Snap Channel: $lxd_snap_chan"
+        echo "  MicroCeph Snap Channel: $microceph_snap_chan"
+        echo "  MicroOVN Snap Channel: $microovn_snap_chan"
+        echo "  MicroCloud Snap Channel: $microcloud_snap_chan"
+        echo "  With OVN Underlay Network: $with_ovn_underlay_net"
+        echo "  With Ceph Encryption: $with_ceph_encrypt"
+        echo "  With Ceph Public Network: $with_ceph_public_net"
+        echo "  With Ceph Cluster Network: $with_ceph_cluster_net"
+        echo "  With Tracing: $with_tracing"
+        if [ "$with_tracing" = true ]; then
+            echo "  MicroCloud Snap Package Source Path: $microcloud_snap_pkg_source_path"
+            echo "  MicroCeph Snap Package Source Path: $microceph_snap_pkg_source_path"
+            echo "  MicroOVN Snap Package Source Path: $microovn_snap_pkg_source_path"
+            echo "  LXD Snap Package Source Path: $lxd_snap_pkg_source_path"
+        fi
+
+        instances=4
+
+        # Check that the 'disks' storage pool exists
+        if lxc storage show disks >/dev/null 2>&1; then
+            echo "Storage pool 'disks' exists."
+        else
+            echo "Error: Storage pool 'disks' does not exist."
+            echo "Please create the 'disks' storage pool before running this script."
+            exit 1
+        fi
+
+        # Ensure required storage volumes exist
+        echo "Checking required storage volumes..."
+
+        # Ensure volumes local1 to localN
+        for i in $(seq 1 "$instances"); do
+            vol="local$i"
+            ensure_volume_exists disks "$vol" --type block
+        done
+
+        # Ensure volumes remote1 to remoteN with size=20GiB
+        for i in $(seq 1 "$instances"); do
+            vol="remote$i"
+            ensure_volume_exists disks "$vol" --type block size=20GiB
+        done
+
+        # Initialize instances
+        echo "Initializing instances..."
+
+        for i in $(seq 1 "$instances"); do
+            instance_name="micro$i"
+            recreate_instance "$instance_name"
+        done
+
+        # Attach disks to instances
+        lxc storage volume attach disks local1 micro1
+        lxc storage volume attach disks local2 micro2
+        lxc storage volume attach disks local3 micro3
+        lxc storage volume attach disks local4 micro4
+        lxc storage volume attach disks remote1 micro1
+        lxc storage volume attach disks remote2 micro2
+        lxc storage volume attach disks remote3 micro3
+        lxc storage volume attach disks remote4 micro4
+
+        # Check networks
+        echo "Checking networks..."
+        ensure_network_exists "microbr0" # MicroCloud mgmt network (mandatory)
+        netCount=1
+        lxc config device add micro1 eth1 nic network=microbr0 name=eth1
+        lxc config device add micro2 eth1 nic network=microbr0 name=eth1
+        lxc config device add micro3 eth1 nic network=microbr0 name=eth1
+        lxc config device add micro4 eth1 nic network=microbr0 name=eth1
+        netCount=$((netCount+1))
+
+        if [ "$with_ovn_underlay_net" = true ]; then
+            echo "Setting up OVN underlay network..."
+            ensure_network_exists "ovnbr1"
+            lxc config device add micro1 eth$netCount nic network=ovnbr1 name=eth$netCount
+            lxc config device add micro2 eth$netCount nic network=ovnbr1 name=eth$netCount
+            lxc config device add micro3 eth$netCount nic network=ovnbr1 name=eth$netCount
+            lxc config device add micro4 eth$netCount nic network=ovnbr1 name=eth$netCount
+            netCount=$((netCount+1))
+            ovn_underlay_network_addr=$(lxc network get ovnbr1 ipv4.address)
+        fi
+
+        if [ "$with_ceph_public_net" = true ]; then
+            echo "Setting up Ceph public network..."
+            ensure_network_exists "cephbr0"
+            lxc config device add micro1 eth$netCount nic network=cephbr0 name=eth$netCount
+            lxc config device add micro2 eth$netCount nic network=cephbr0 name=eth$netCount
+            lxc config device add micro3 eth$netCount nic network=cephbr0 name=eth$netCount
+            lxc config device add micro4 eth$netCount nic network=cephbr0 name=eth$netCount
+            netCount=$((netCount+1))
+            ceph_public_network_addr=$(lxc network get cephbr0 ipv4.address)
+        fi
+
+        if [ "$with_ceph_cluster_net" = true ]; then
+            echo "Setting up Ceph cluster network..."
+            ensure_network_exists "cephbr1"
+            lxc config device add micro1 eth$netCount nic network=cephbr1 name=eth$netCount
+            lxc config device add micro2 eth$netCount nic network=cephbr1 name=eth$netCount
+            lxc config device add micro3 eth$netCount nic network=cephbr1 name=eth$netCount
+            lxc config device add micro4 eth$netCount nic network=cephbr1 name=eth$netCount
+            netCount=$((netCount+1))
+            ceph_cluster_network_addr=$(lxc network get cephbr1 ipv4.address)
+        fi
+
+        if [ "$with_tracing" = true ]; then
+            # Add cloud-init configuration for tracing to micro1
+            cat <<EOF > /tmp/docker-with-jaeger.yaml
+#cloud-config
+package_update: true
+runcmd:
+    # Install Docker to run Jaeger collector and UI in the background
+   - curl -fsSL https://get.docker.com -o install-docker.sh
+   - sh install-docker.sh --version 24.0
+   - docker pull jaegertracing/all-in-one:1.57
+   - docker run -d --rm --name jaeger -p 6831:6831/udp -p 6832:6832/udp -p 5778:5778 -p 16686:16686 -p 4317:4317 -p 4318:4318 -p 14250:14250 -p 14268:14268 -p 9411:9411 jaegertracing/all-in-one:1.57
+EOF
+            lxc config set micro1 cloud-init.user-data - < /tmp/docker-with-jaeger.yaml
+            rm /tmp/docker-with-jaeger.yaml
+        fi
+
+        echo "Starting instances..."
+        lxc start micro1
+        lxc start micro2
+        lxc start micro3
+        lxc start micro4
+
+        # Wait for cloud-init to finish
+        echo "Waiting for cloud-init to finish..."
+        sleep 15
+        wait_for_instances
+
+        # Configure instances nics
+        for i in $(seq 1 4); do
+            configure_instance_nics "micro$i" "$ovn_underlay_network_addr" "$ceph_public_network_addr" "$ceph_cluster_network_addr"
+        done
+
+        jaegerUIAddr=""
+        if [ "$with_tracing" = true ]; then
+            check_jq
+            check_yq
+
+            mapfile -t ips < <(lxc ls -f json | jq -r '.[] | select(.name | test("^micro")) | .state.network["enp5s0"].addresses[] | select(.family == "inet") | .address')
+            micro1_internal_addr="${ips[0]}"
+            jaegerUIAddr="http://$micro1_internal_addr:16686"
+
+            if [ $microcloud_tracing == 1 -o $microcloudd_tracing == 1 ]; then
+                echo "Auto-instrumenting the MicroCloud snap (CLI-enabled tracing: $microcloud_tracing, Daemon-enabled tracing: $microcloudd_tracing)..."
+                build_traced_microcloud_snaps "$microcloud_snap_pkg_source_path" "$micro1_internal_addr" "$microcloud_tracing" "$microcloudd_tracing"
+
+                for i in $(seq 1 4); do
+                    nodeName="micro$i"
+                    lxc file push $microcloud_snap_pkg_source_path/traced_microcloud_$nodeName.snap $nodeName/root/traced_microcloud.snap
+                    # TODO: for now, I did not find a way to run the snap with strict confinement with the background microtrace process...
+                    # There must be some interfaces that need to be connected to allow microtrace to intercept the MicroCloud daemon/CLI processes function calls.
+                    # I tried `snap connect microcloud:system-observe` and `snap connect microcloud:process-control` but I still have a permission denied error.
+                    lxc exec micro$i -- snap install traced_microcloud.snap --devmode --dangerous
+                    lxc exec micro$i -- snap restart microcloud
+                done
+            else
+                for i in $(seq 1 4); do
+                    lxc exec micro$i -- snap install microcloud --channel=$microcloud_snap_chan --cohort="+"
+                done
+            fi
+
+            if [ $microovn_tracing == 1 -o $microovnd_tracing == 1 ]; then
+                echo "Auto-instrumenting the MicroOVN snap (CLI-enabled tracing: $microovn_tracing, Daemon-enabled tracing: $microovnd_tracing)..."
+                build_traced_microovn_snaps "$microovn_snap_pkg_source_path" "$micro1_internal_addr" "$microovn_tracing" "$microovnd_tracing"
+
+                for i in $(seq 1 4); do
+                    nodeName="micro$i"
+                    lxc file push $microovn_snap_pkg_source_path/traced_microovn_$nodeName.snap $nodeName/root/traced_microovn.snap
+                    # TODO: same as above
+                    lxc exec micro$i -- snap install traced_microovn.snap --devmode --dangerous
+                    microovnPlugs="firewall-control hardware-observe hugepages-control network-control openvswitch-support process-control system-trace"
+                    for plug in $microovnPlugs; do
+                        lxc exec micro$i -- snap connect microovn:$plug
+                    done
+
+                    lxc exec micro$i -- snap restart microovn
+                done
+            else
+                for i in $(seq 1 4); do
+                    lxc exec micro$i -- snap install microovn --channel=$microovn_snap_chan --cohort="+"
+                done
+            fi
+
+            if [ $microceph_tracing == 1 -o $microcephd_tracing == 1 ]; then
+                echo "Auto-instrumenting the MicroCeph snap (CLI-enabled tracing: $microceph_tracing, Daemon-enabled tracing: $microcephd_tracing)..."
+                build_traced_microceph_snaps "$microceph_snap_pkg_source_path" "$micro1_internal_addr" "$microceph_tracing" "$microcephd_tracing"
+
+                for i in $(seq 1 4); do
+                    nodeName="micro$i"
+                    lxc file push $microceph_snap_pkg_source_path/traced_microceph_$nodeName.snap $nodeName/root/traced_microceph.snap
+                    # TODO: same as above
+                    lxc exec micro$i -- snap install traced_microceph.snap --devmode --dangerous
+                    microcephPlugs="block-devices hardware-observe"
+                    for plug in $microcephPlugs; do
+                        lxc exec micro$i -- snap connect microceph:$plug
+                    done
+
+                    lxc exec micro$i -- snap restart microceph.daemon
+                done
+            else
+                for i in $(seq 1 4); do
+                    lxc exec micro$i -- snap install microceph --channel=$microceph_snap_chan --cohort="+"
+                done
+            fi
+
+            if [ $lxd_tracing == 1 ]; then
+                echo "Auto-instrumenting the LXD snap..."
+                build_traced_lxd_snaps "$lxd_snap_pkg_source_path" "$micro1_internal_addr"
+
+                for i in $(seq 1 4); do
+                    nodeName="micro$i"
+                    lxc file push $lxd_snap_pkg_source_path/traced_lxd_$nodeName.snap $nodeName/root/traced_lxd.snap
+                    # TODO: same as above
+                    lxc exec micro$i -- snap install traced_lxd.snap --devmode --dangerous
+                    # TODO: are there any interfaces that need to be connected?
+                    lxc exec micro$i -- snap restart lxd
+                done
+            else
+                for i in $(seq 1 4); do
+                    lxc exec micro$i -- snap install lxd --channel=$lxd_snap_chan
+                done
+            fi
+        else
+            # Install the snaps in the instances
+            for i in $(seq 1 4); do
+                lxc exec micro$i -- snap install lxd --channel=$lxd_snap_chan
+                lxc exec micro$i -- snap install microceph --channel=$microceph_snap_chan --cohort="+"
+                lxc exec micro$i -- snap install microovn --channel=$microovn_snap_chan --cohort="+"
+                lxc exec micro$i -- snap install microcloud --channel=$microcloud_snap_chan --cohort="+"
+            done
+        fi
+
+        for i in $(seq 1 4); do
+            if [ "$with_custom_microcloudd" = true ]; then
+                lxc exec micro$i -- rm -f /var/snap/microcloud/common/microcloudd.debug
+                lxc file push --quiet /home/infinity/go/bin/microcloudd micro$i/var/snap/microcloud/common/microcloudd.debug
+                lxc exec micro$i -- systemctl restart snap.microcloud.daemon
+                if [ "$with_tracing" = true ]; then
+                    lxc exec micro$i -- systemctl restart snap.microcloud.daemon
+                fi
+            fi
+
+            if [ "$with_custom_microcloud" = true ]; then
+                lxc exec micro$i -- rm -f /var/snap/microcloud/common/microcloud.debug
+                lxc file push --quiet /home/infinity/go/bin/microcloud micro$i/var/snap/microcloud/common/microcloud.debug
+                lxc exec micro$i -- systemctl restart snap.microcloud.daemon
+                if [ "$with_tracing" = true ]; then
+                    lxc exec micro$i -- systemctl restart snap.microcloud.daemon
+                fi
+            fi
+
+            if [ "$with_ceph_encrypt" = true ]; then
+                lxc exec micro$i -- snap connect microceph:dm-crypt
+                lxc exec micro$i -- snap restart microceph.daemon
+            fi
+        done
+
+        if [ "$with_tracing" = true ]; then
+            echo -e "View your infrastructure traces at: \033[32m$jaegerUIAddr\033[0m"
+            xdg-open $jaegerUIAddr &
+        fi
+
+        echo "Setup complete."
+        ;;
+    cleanup)
+        # Begin cleanup logic
+        echo "Starting cleanup..."
+        lxc delete --force micro1
+        lxc delete --force micro2
+        lxc delete --force micro3
+        lxc delete --force micro4
+        ;;
+    --help)
+        show_help
+        exit 0
+        ;;
+    *)
+        echo "Unknown command: $command"
+        show_help
+        exit 1
+        ;;
+esac
+
